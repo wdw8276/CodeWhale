@@ -226,8 +226,11 @@ pub enum Event {
         id: String,
         tool_name: String,
         description: String,
-        /// Fingerprint key for per‑call approval caching (§5.A).
+        /// Exact-argument fingerprint, used to scope *denials* (#1617).
         approval_key: String,
+        /// Lossy / arity-aware fingerprint, used to scope *approvals* so an
+        /// "approve for session" covers later flag variants (v0.8.37).
+        approval_grouping_key: String,
     },
 
     /// Request user input for a tool call
@@ -260,6 +263,24 @@ pub enum Event {
         denial_reason: String,
         blocked_network: bool,
         blocked_write: bool,
+    },
+
+    // === Prefix-Cache Stability Events ===
+    /// The prefix (system prompt + tool specs) changed between turns,
+    /// which invalidates DeepSeek's KV prefix cache. Carries diagnostics
+    /// for the TUI to surface.
+    PrefixCacheChange {
+        /// Human-readable description of what changed.
+        description: String,
+        /// Whether the system prompt component changed.
+        system_prompt_changed: bool,
+        /// Whether the tool set component changed.
+        tools_changed: bool,
+        /// Overall prefix stability percentage (100 = fully stable).
+        stability_pct: u32,
+        /// True when the prefix actually changed (cache invalidated).
+        /// False for routine stable-check heartbeats.
+        changed: bool,
     },
 }
 

@@ -56,6 +56,7 @@ fn stream_idle_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+use crate::config::ApiProvider;
 use crate::llm_client::StreamEventBox;
 use crate::logging;
 use crate::models::{
@@ -75,7 +76,7 @@ impl DeepSeekClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse> {
-        let messages = build_chat_messages_for_request(request);
+        let messages = build_chat_messages_for_request_and_provider(request, self.api_provider);
         let mut body = json!({
             "model": request.model,
             "messages": messages,
@@ -145,7 +146,7 @@ impl DeepSeekClient {
         request: MessageRequest,
     ) -> Result<StreamEventBox> {
         // Try true SSE streaming via chat completions (widely supported)
-        let messages = build_chat_messages_for_request(&request);
+        let messages = build_chat_messages_for_request_and_provider(&request, self.api_provider);
         let mut body = json!({
             "model": request.model,
             "messages": messages,
@@ -193,6 +194,7 @@ impl DeepSeekClient {
             &mut body,
             &request.model,
             request.reasoning_effort.as_deref(),
+            self.api_provider,
         );
 
         let url = api_url(&self.base_url, "chat/completions");
@@ -213,6 +215,7 @@ impl DeepSeekClient {
         }
 
         let model = request.model.clone();
+        let api_provider = self.api_provider;
 
         // Capture transport-shape headers before we consume `response` into
         // `bytes_stream()`. They are surfaced in the decode-error log path so
@@ -249,7 +252,8 @@ impl DeepSeekClient {
             let mut text_started = false;
             let mut thinking_started = false;
             let mut tool_indices: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-            let is_reasoning_model = requires_reasoning_content(&model);
+            let is_reasoning_model =
+                requires_reasoning_content(&model) && provider_accepts_reasoning_content(api_provider);
 
             let mut byte_stream = std::pin::pin!(byte_stream);
             let idle = stream_idle_timeout();
@@ -412,8 +416,16 @@ pub(super) fn build_chat_messages(
     )
 }
 
+#[cfg(test)]
 pub(super) fn build_chat_messages_for_request(request: &MessageRequest) -> Vec<Value> {
     PromptBuilder::for_request(request).build()
+}
+
+pub(super) fn build_chat_messages_for_request_and_provider(
+    request: &MessageRequest,
+    provider: ApiProvider,
+) -> Vec<Value> {
+    PromptBuilder::for_request(request).build_for_provider(provider)
 }
 
 pub(crate) fn inspect_prompt_for_request(request: &MessageRequest) -> PromptInspection {
@@ -441,12 +453,27 @@ impl<'a> PromptBuilder<'a> {
         }
     }
 
+    #[cfg(test)]
     fn build(self) -> Vec<Value> {
         build_chat_messages_with_reasoning(
             self.system,
             self.messages,
             self.model,
             should_replay_reasoning_content(self.model, self.reasoning_effort),
+            false,
+        )
+    }
+
+    fn build_for_provider(self, provider: ApiProvider) -> Vec<Value> {
+        build_chat_messages_with_reasoning(
+            self.system,
+            self.messages,
+            self.model,
+            should_replay_reasoning_content_for_provider(
+                provider,
+                self.model,
+                self.reasoning_effort,
+            ),
             false,
         )
     }
@@ -1371,15 +1398,6 @@ pub(super) fn tool_to_chat(tool: &Tool) -> Value {
             "parameters": tool.input_schema,
         }
     });
-    if let Some(allowed_callers) = &tool.allowed_callers {
-        value["allowed_callers"] = json!(allowed_callers);
-    }
-    if let Some(defer_loading) = tool.defer_loading {
-        value["defer_loading"] = json!(defer_loading);
-    }
-    if let Some(input_examples) = &tool.input_examples {
-        value["input_examples"] = json!(input_examples);
-    }
     if let Some(strict) = tool.strict
         && let Some(function) = value.get_mut("function")
     {
@@ -1445,8 +1463,9 @@ pub(super) fn sanitize_thinking_mode_messages(
     body: &mut Value,
     model: &str,
     effort: Option<&str>,
+    provider: ApiProvider,
 ) -> Option<u32> {
-    if !should_replay_reasoning_content(model, effort) {
+    if !should_replay_reasoning_content_for_provider(provider, model, effort) {
         return None;
     }
     let messages = body.get_mut("messages").and_then(Value::as_array_mut)?;
@@ -1602,6 +1621,30 @@ fn should_replay_reasoning_content(model: &str, effort: Option<&str>) -> bool {
     }
 
     requires_reasoning_content(model)
+}
+
+fn should_replay_reasoning_content_for_provider(
+    provider: ApiProvider,
+    model: &str,
+    effort: Option<&str>,
+) -> bool {
+    if !provider_accepts_reasoning_content(provider) {
+        return false;
+    }
+    should_replay_reasoning_content(model, effort)
+}
+
+fn provider_accepts_reasoning_content(provider: ApiProvider) -> bool {
+    matches!(
+        provider,
+        ApiProvider::Deepseek
+            | ApiProvider::DeepseekCN
+            | ApiProvider::NvidiaNim
+            | ApiProvider::Openrouter
+            | ApiProvider::Novita
+            | ApiProvider::Fireworks
+            | ApiProvider::Sglang
+    )
 }
 
 fn has_deepseek_r_series_marker(model_lower: &str) -> bool {
@@ -1859,11 +1902,14 @@ pub(super) fn parse_sse_chunk(
             .map(str::to_string);
 
         if let Some(delta) = delta {
+            let reasoning_text = reasoning_field(delta).filter(|s| !s.is_empty());
+            let content_text = delta
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+
             // Handle reasoning_content / reasoning thinking deltas.
-            if is_reasoning_model
-                && let Some(reasoning) = reasoning_field(delta)
-                && !reasoning.is_empty()
-            {
+            if is_reasoning_model && let Some(reasoning) = reasoning_text {
                 if !*thinking_started {
                     events.push(StreamEvent::ContentBlockStart {
                         index: *content_index,
@@ -1881,10 +1927,18 @@ pub(super) fn parse_sse_chunk(
                 });
             }
 
+            // Generic OpenAI-compatible proxies sometimes stream answer text
+            // in `reasoning_content`. If this provider is not one whose
+            // reasoning-content semantics we support, render that field as
+            // normal text when no `content` delta is present.
+            let effective_content = match content_text {
+                Some(content) => Some(content),
+                None if !is_reasoning_model => reasoning_text,
+                None => None,
+            };
+
             // Handle regular content
-            if let Some(content) = delta.get("content").and_then(Value::as_str)
-                && !content.is_empty()
-            {
+            if let Some(content) = effective_content {
                 // Close thinking block if transitioning to text
                 if *thinking_started {
                     events.push(StreamEvent::ContentBlockStop {
@@ -2156,6 +2210,10 @@ mod stream_decoder_tests {
     /// Decode a raw SSE-data JSON chunk into our internal events, mirroring
     /// the per-event call shape used by `handle_chat_completion_stream`.
     fn decode_chunk(json_text: &str) -> Vec<StreamEvent> {
+        decode_chunk_with_reasoning(json_text, true)
+    }
+
+    fn decode_chunk_with_reasoning(json_text: &str, is_reasoning_model: bool) -> Vec<StreamEvent> {
         let chunk: Value = serde_json::from_str(json_text).expect("valid SSE JSON");
         let mut content_index = 0u32;
         let mut text_started = false;
@@ -2167,7 +2225,7 @@ mod stream_decoder_tests {
             &mut text_started,
             &mut thinking_started,
             &mut tool_indices,
-            true,
+            is_reasoning_model,
         )
     }
 
@@ -2222,6 +2280,45 @@ mod stream_decoder_tests {
                     ..
                 } if thinking == "plan...")),
             "should yield a ThinkingDelta carrying 'plan...'; got {events:?}"
+        );
+    }
+
+    #[test]
+    fn decoder_treats_reasoning_content_as_text_when_provider_does_not_support_reasoning() {
+        let events = decode_chunk_with_reasoning(
+            r#"{"choices":[{"delta":{"reasoning_content":"hello"}}]}"#,
+            false,
+        );
+
+        assert!(
+            matches!(
+                events.first(),
+                Some(StreamEvent::ContentBlockStart {
+                    content_block: ContentBlockStart::Text { .. },
+                    ..
+                })
+            ),
+            "first event should open a text block; got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::TextDelta { text },
+                    ..
+                } if text == "hello"
+            )),
+            "should yield a TextDelta carrying 'hello'; got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::ThinkingDelta { .. },
+                    ..
+                }
+            )),
+            "should not emit thinking deltas for generic providers; got {events:?}"
         );
     }
 
@@ -2729,7 +2826,11 @@ mod alias_thinking_detection_tests {
     //! in the thinking mode must be passed back to the API") on the second
     //! turn. See upstream API docs:
     //! https://api-docs.deepseek.com/guides/thinking_mode
-    use super::{requires_reasoning_content, should_replay_reasoning_content};
+    use super::{
+        provider_accepts_reasoning_content, requires_reasoning_content,
+        should_replay_reasoning_content,
+    };
+    use crate::config::ApiProvider;
 
     #[test]
     fn aliases_routed_to_v4_require_reasoning_content() {
@@ -2788,5 +2889,12 @@ mod alias_thinking_detection_tests {
             "deepseek-reasoner",
             Some("medium")
         ));
+    }
+
+    #[test]
+    fn generic_openai_provider_does_not_accept_reasoning_content_semantics() {
+        assert!(!provider_accepts_reasoning_content(ApiProvider::Openai));
+        assert!(provider_accepts_reasoning_content(ApiProvider::Deepseek));
+        assert!(provider_accepts_reasoning_content(ApiProvider::NvidiaNim));
     }
 }

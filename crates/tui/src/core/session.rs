@@ -4,6 +4,7 @@
 
 use crate::cycle_manager::CycleBriefing;
 use crate::models::{Message, SystemPrompt, Usage};
+use crate::prefix_cache::PrefixStabilityManager;
 use crate::project_context::{ProjectContext, load_project_context_with_parents};
 use crate::tui::approval::ApprovalMode;
 use crate::working_set::WorkingSet;
@@ -31,6 +32,9 @@ pub struct Session {
 
     /// System prompt (optional)
     pub system_prompt: Option<SystemPrompt>,
+    /// True when `system_prompt` came from an explicit runtime API override
+    /// and should not be replaced by mode/context refreshes.
+    pub system_prompt_override: bool,
     /// Hash of the last assembled stable system prompt. Used to avoid
     /// replacing `system_prompt` when unchanged.
     pub last_system_prompt_hash: Option<u64>,
@@ -82,6 +86,11 @@ pub struct Session {
     /// Briefings produced at past cycle boundaries, in chronological order.
     /// Bounded growth: one entry per cycle, briefing capped at ~3,000 tokens.
     pub cycle_briefings: Vec<CycleBriefing>,
+
+    /// Prefix-cache stability monitor (inspired by Reasonix's Pillar 1).
+    /// Tracks the immutable prefix fingerprint and detects drift across turns.
+    /// Set during engine construction; None until the first system prompt assembly.
+    pub prefix_stability: Option<PrefixStabilityManager>,
 }
 
 /// Cumulative usage statistics for a session.
@@ -135,6 +144,7 @@ impl Session {
             auto_model: false,
             workspace,
             system_prompt: None,
+            system_prompt_override: false,
             compaction_summary_prompt: None,
             messages: Vec::new(),
             total_usage: SessionUsage::default(),
@@ -155,6 +165,7 @@ impl Session {
             cycle_count: 0,
             current_cycle_started: Utc::now(),
             cycle_briefings: Vec::new(),
+            prefix_stability: None,
         }
     }
 
