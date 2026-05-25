@@ -1978,11 +1978,10 @@ fn composer_top_right_chrome(app: &App, area_width: u16) -> Option<Line<'static>
         )));
     }
 
-    // No receipt: show vim mode (if enabled) + session title (if present).
     let mut spans: Vec<Span> = Vec::new();
     if app.composer.vim_enabled {
         spans.push(Span::styled(
-            app.composer.vim_mode.label().to_string(),
+            truncate_display_width(app.composer.vim_mode.label(), max_width),
             vim_mode_style(app.composer.vim_mode),
         ));
     }
